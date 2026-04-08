@@ -1,3 +1,12 @@
+重要文件功能解释：
+graph_probing/construct_dataset.py: 数据集预处理，将短句拼接为800词左右的片段。删除拼接后过长、过短以及困惑度最高和最低的2%数据。
+graph_probing/compute_llm_network.py: 将处理后的数据集输入模型，计算神经拓扑图
+graph_probing/compute_cross_layer_corr.py: 将处理后的数据输入模型，通过fisher-z累加计算层内、层间的平均神经拓扑图
+
+以下为原README.md内容：
+
+-----------------------------
+
 # LLM Graph Probing
 
 Graph probing is a tool for learning the functional connectivity topology of neurons in large language models (LLMs) and relating it to language generation performance. The project was initially described in the paper [***"Learning Neural Topology of Language Models with Graph Probing"***](https://arxiv.org/abs/2506.01042).
