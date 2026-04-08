@@ -8,18 +8,24 @@ import numpy as np
 import pandas as pd
 import torch
 
+from transformers import AutoConfig
 from utils.constants import hf_model_name_map
 from utils.model_utils import load_tokenizer_and_model
 
 flags.DEFINE_string("dataset", "openwebtext", "The name of the dataset.")
 flags.DEFINE_string("llm_model_name", "gpt2", "The name of the LLM model.")
 flags.DEFINE_integer("ckpt_step", -1, "The checkpoint step.")
-flags.DEFINE_multi_integer("llm_layer", [0], "Layer IDs for network construction.")
+flags.DEFINE_multi_integer("llm_layer", [0, 1], "Layer IDs for network construction.")
 flags.DEFINE_integer("batch_size", 32, "Batch size.")
 flags.DEFINE_multi_integer("gpu_id", [0, 1], "The GPU ID.")
 flags.DEFINE_integer("num_workers", 30, "Number of processes for computing networks.")
 flags.DEFINE_boolean("resume", False, "Resume from the last generation.")
 flags.DEFINE_float("network_density", 1.0, "The density of the network.")
+flags.DEFINE_string("dataset_path", None, "Optional: Local path to the dataset CSV file. If provided, will load from this path instead of auto-generated path.")
+flags.DEFINE_integer("data_start", 0, "Start index of the dataset subset to process.")
+flags.DEFINE_integer("data_end", None, "End index of the dataset subset to process. If None, process until the end.")
+flags.DEFINE_boolean("all_layers", False, "If True, automatically process all layers of the model. Overrides --llm_layer.")
+flags.DEFINE_string("output_dir", None, "Optional: Custom output directory for saving results. If None, use default directory structure.")
 FLAGS = flags.FLAGS
 
 
@@ -36,8 +42,22 @@ def run_llm(
     resume,
     p_save_path,
     dataset_name,
+    data_start,
+    data_end,
+    all_layers,
 ):
     tokenizer, model = load_tokenizer_and_model(model_name, ckpt_step, gpu_id)
+    
+    # Auto-detect all layers if requested
+    if all_layers:
+        if hasattr(model.config, 'num_hidden_layers'):
+            num_layers = model.config.num_hidden_layers
+        elif hasattr(model.config, 'n_layer'):
+            num_layers = model.config.n_layer
+        else:
+            raise ValueError(f"Cannot determine number of layers for model {model_name}")
+        layer_list = list(range(num_layers))
+        print(f"[Producer {rank}] Auto-detected {num_layers} layers: {layer_list}")
 
     data = pd.read_csv(dataset_filename)
     
@@ -53,18 +73,28 @@ def run_llm(
             original_input_texts.append(prompt)
     else:
         original_input_texts = data["sentences"].to_list()
+    
+    # Apply data subset selection
+    if data_end is not None:
+        original_input_texts = original_input_texts[data_start:data_end]
+        print(f"[Producer {rank}] Using data subset: [{data_start}:{data_end}] ({len(original_input_texts)} samples)")
+    elif data_start > 0:
+        original_input_texts = original_input_texts[data_start:]
+        print(f"[Producer {rank}] Using data subset: [{data_start}:] ({len(original_input_texts)} samples)")
         
     num_sentences = len(original_input_texts)
     if not resume:
         input_texts = original_input_texts[rank::num_producers]
-        sentence_indices = list(range(rank, num_sentences, num_producers))
+        # Adjust sentence indices to reflect the actual position in the original dataset
+        sentence_indices = list(range(rank + data_start, num_sentences + data_start, num_producers))
     else:
         input_texts = []
         sentence_indices = []
-        for sentence_idx in range(rank, num_sentences, num_producers):
-            if not os.path.exists(f"{p_save_path}/{sentence_idx}"):
-                input_texts.append(original_input_texts[sentence_idx])
-                sentence_indices.append(sentence_idx)
+        for local_idx in range(rank, num_sentences, num_producers):
+            actual_idx = local_idx + data_start
+            if not os.path.exists(f"{p_save_path}/{actual_idx}"):
+                input_texts.append(original_input_texts[local_idx])
+                sentence_indices.append(actual_idx)
 
     if len(input_texts) > 0:
         tokenizer.pad_token = tokenizer.eos_token
@@ -124,13 +154,38 @@ def run_corr(queue, layer_list, p_save_path, worker_idx, network_density=1.0):
 
 def main(_):
     model_name = FLAGS.llm_model_name
-    hf_model_name = hf_model_name_map[model_name]
-    if FLAGS.ckpt_step == -1:
-        dir_name = f"data/graph_probing/{model_name}/{FLAGS.dataset}"
-    else:
-        dir_name = f"data/graph_probing/{model_name}_step{FLAGS.ckpt_step}/{FLAGS.dataset}"
+    hf_model_name = hf_model_name_map.get(model_name, model_name)
     
-    if FLAGS.dataset == "art":
+    # Determine output directory
+    if FLAGS.output_dir:
+        # Use custom output directory
+        dir_name = FLAGS.output_dir
+        print(f"Using custom output directory: {dir_name}")
+    else:
+        # Use default directory structure
+        # Extract model name from path if it's a local path
+        if os.path.isabs(model_name) or os.path.sep in model_name:
+            # If it's a path, use the basename as model name for directory
+            model_dir_name = os.path.basename(model_name.rstrip(os.path.sep))
+        else:
+            # Otherwise use the model name as is
+            model_dir_name = model_name
+        
+        # Add network density to directory name to avoid overwriting different density data
+        if FLAGS.network_density < 1.0:
+            density_suffix = f"-{FLAGS.network_density}"
+        else:
+            density_suffix = ""
+        
+        if FLAGS.ckpt_step == -1:
+            dir_name = f"data/graph_probing/{model_dir_name}{density_suffix}/{FLAGS.dataset}"
+        else:
+            dir_name = f"data/graph_probing/{model_dir_name}{density_suffix}_step{FLAGS.ckpt_step}/{FLAGS.dataset}"
+    
+    # Load dataset from specified path or auto-generated path
+    if FLAGS.dataset_path:
+        dataset_filename = FLAGS.dataset_path
+    elif FLAGS.dataset == "art":
         dataset_filename = "st_data/art.csv"
     elif FLAGS.dataset == "world_place":
         dataset_filename = "st_data/world_place.csv"
@@ -143,7 +198,30 @@ def main(_):
 
     os.makedirs(dir_name, exist_ok=True)
 
-    layer_list = FLAGS.llm_layer
+    # Prepare layer list
+    if FLAGS.all_layers:
+        # Load model config to get number of layers
+        config = AutoConfig.from_pretrained(hf_model_name)
+        if hasattr(config, 'num_hidden_layers'):
+            num_layers = config.num_hidden_layers
+        elif hasattr(config, 'n_layer'):
+            num_layers = config.n_layer
+        else:
+            raise ValueError(f"Cannot determine number of layers for model {hf_model_name}")
+        layer_list = list(range(num_layers))
+        print(f"All layers mode enabled. Auto-detected {num_layers} layers: {layer_list}")
+    else:
+        layer_list = FLAGS.llm_layer
+        print(f"Processing specified layers: {layer_list}")
+    
+    # Print data range info
+    if FLAGS.data_end is not None:
+        print(f"Processing data subset: [{FLAGS.data_start}:{FLAGS.data_end}]")
+    elif FLAGS.data_start > 0:
+        print(f"Processing data subset: [{FLAGS.data_start}:]")
+    else:
+        print(f"Processing all data")
+    
     queue = Queue()
     producers = []
 
@@ -163,6 +241,9 @@ def main(_):
                 FLAGS.resume,
                 dir_name,
                 FLAGS.dataset,
+                FLAGS.data_start,
+                FLAGS.data_end,
+                FLAGS.all_layers,
             )
         )
         p.start()
